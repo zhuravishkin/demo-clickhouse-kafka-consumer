@@ -1,0 +1,20 @@
+{
+  "id": {
+    "type": "long"
+  },
+  "token": "dpi",
+  "name": {
+    "type": "string"
+  },
+  "age": {
+    "type": "integer"
+  },
+  "created_at": {
+    "type": "timestamp"
+  },
+  "context": {
+    "offset": {
+      "type": "string"
+    }
+  }
+}
