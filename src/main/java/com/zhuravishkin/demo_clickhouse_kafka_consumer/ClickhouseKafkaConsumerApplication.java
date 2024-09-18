@@ -96,9 +96,10 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
                 "payload String, " +
                 "error_message String, " +
                 "_timestamp DateTime DEFAULT now()" +
-                ") ENGINE = MergeTree() ORDER BY _timestamp";
+                ") ENGINE = MergeTree() ORDER BY _timestamp TTL _timestamp + INTERVAL 3 DAY";
 
         statement.execute(createErrorTableQuery);
+        System.out.println("error table created: " + errorTableName);
     }
 
     private static Map<String, String> extractColumns(JsonNode node) {
