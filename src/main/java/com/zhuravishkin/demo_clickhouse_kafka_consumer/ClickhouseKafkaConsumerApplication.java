@@ -28,7 +28,7 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
 
     @Override
     public void run(String... args) throws Exception {
-        String s = Files.readString(Path.of("src/main/resources/templates/config2.json"));
+        String s = Files.readString(Path.of("src/main/resources/templates/config1.json"));
         System.out.println(s);
 
         processTableFromJson(s);
@@ -51,8 +51,10 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
 
                 if (!tableExists) {
                     createTable(stmt, tableName, columns);
+                    createErrorTable(stmt, tableName);
                     createKafkaTable(stmt, tableName);
                     createMaterializedView(stmt, tableName, columns);
+                    createErrorMaterializedView(stmt, tableName);
                 } else {
                     Map<String, String> newColumns = addMissingColumns(stmt, tableName, columns);
                     updateMaterializedView(stmt, tableName, columns, newColumns);
@@ -80,11 +82,23 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
             createTableQuery.append(entry.getKey()).append(" ").append(entry.getValue()).append(", ");
         }
 
-        createTableQuery.append("_timestamp DateTime DEFAULT now()) ENGINE = MergeTree() ORDER BY _timestamp");
+        createTableQuery.append("_timestamp DateTime DEFAULT now()) ENGINE = MergeTree() ORDER BY _timestamp ");
+        createTableQuery.append("TTL _timestamp + INTERVAL 3 DAY");
         System.out.println(createTableQuery);
 
         statement.execute(createTableQuery.toString());
         System.out.println("table created: " + tableName);
+    }
+
+    private static void createErrorTable(Statement statement, String tableName) throws SQLException {
+        String errorTableName = tableName + "_errors";
+        String createErrorTableQuery = "CREATE TABLE IF NOT EXISTS " + errorTableName + " (" +
+                "payload String, " +
+                "error_message String, " +
+                "_timestamp DateTime DEFAULT now()" +
+                ") ENGINE = MergeTree() ORDER BY _timestamp";
+
+        statement.execute(createErrorTableQuery);
     }
 
     private static Map<String, String> extractColumns(JsonNode node) {
@@ -172,7 +186,8 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
                 .append("SETTINGS kafka_broker_list = '192.168.1.17:9092', ")
                 .append("kafka_topic_list = '").append(tableName).append("_topic', ")
                 .append("kafka_group_name = '").append(tableName).append("_group', ")
-                .append("kafka_format = 'JSONAsString', kafka_num_consumers = 1");
+                .append("kafka_format = 'JSONAsString', kafka_num_consumers = 1, ")
+                .append("kafka_handle_error_mode = 'stream'");
 
         System.out.println("createKafkaTableQuery: " + createKafkaTableQuery);
         statement.execute(createKafkaTableQuery.toString());
@@ -194,11 +209,30 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
         String createMVQuery = "CREATE MATERIALIZED VIEW IF NOT EXISTS " + mvName +
                 " TO " + tableName +
                 " AS " + selectQuery +
-                " FROM " + kafkaTableName;
+                " FROM " + kafkaTableName +
+                " WHERE _error = ''";
 
         System.out.println("Create Materialized View query: " + createMVQuery);
         statement.execute(createMVQuery);
         System.out.println("Materialized view created: " + mvName);
+    }
+
+    private static void createErrorMaterializedView(Statement statement, String tableName) throws SQLException {
+        String kafkaTableName = tableName + "_kafka";
+        String errorMVName = tableName + "_errors_mv";
+        String errorTableName = tableName + "_errors";
+
+        String createErrorMVQuery = "CREATE MATERIALIZED VIEW IF NOT EXISTS " + errorMVName +
+                " TO " + errorTableName +
+                " AS SELECT " +
+                "_raw_message AS payload, " +
+                "_error AS error_message" +
+                " FROM " + kafkaTableName +
+                " WHERE _error != ''";
+
+        System.out.println("Create Error Materialized View query: " + createErrorMVQuery);
+        statement.execute(createErrorMVQuery);
+        System.out.println("Error Materialized view created: " + errorMVName);
     }
 
     private static String generateJsonExtractExpression(String fullKey) {
