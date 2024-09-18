@@ -12,13 +12,14 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Connection;
 import java.sql.ResultSet;
+import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.*;
 
 @Slf4j
 @SpringBootApplication
 public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
-    private static final String CLICKHOUSE_URL = "jdbc:clickhouse://192.168.1.13:18123/zhuravishkin";
+    private static final String CLICKHOUSE_URL = "jdbc:clickhouse://192.168.1.17:18123/zhuravishkin";
     private static final String COLUMN_TYPE = "Nullable(String)";
 
     public static void main(String[] args) {
@@ -27,7 +28,7 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
 
     @Override
     public void run(String... args) throws Exception {
-        String s = Files.readString(Path.of("src/main/resources/templates/config1.json"));
+        String s = Files.readString(Path.of("src/main/resources/templates/config2.json"));
         System.out.println(s);
 
         processTableFromJson(s);
@@ -35,23 +36,27 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
 
     public static void processTableFromJson(String json) throws Exception {
         try {
+            String tableName = "cep";
             ObjectMapper objectMapper = new ObjectMapper();
             JsonNode rootNode = objectMapper.readTree(json);
-            String tableName = rootNode.get("token").asText();
             System.out.println("payload: " + rootNode);
 
             ClickHouseDataSource dataSource = new ClickHouseDataSource(CLICKHOUSE_URL, new Properties());
             try (Connection conn = dataSource.getConnection("username", "password");
                  Statement stmt = conn.createStatement()) {
                 boolean tableExists = isTableExist(stmt, tableName);
+                System.out.println("tableExists: " + tableExists);
 
-                if (tableExists) {
-                    addMissingColumns(stmt, tableName, rootNode);
+                Map<String, String> columns = extractColumns(rootNode);
+
+                if (!tableExists) {
+                    createTable(stmt, tableName, columns);
+                    createKafkaTable(stmt, tableName);
+                    createMaterializedView(stmt, tableName, columns);
                 } else {
-                    createTable(stmt, tableName, rootNode);
-                    createKafkaConsumer(stmt, tableName, rootNode);
+                    Map<String, String> newColumns = addMissingColumns(stmt, tableName, columns);
+                    updateMaterializedView(stmt, tableName, columns, newColumns);
                 }
-
             }
         } catch (Exception e) {
             log.error(e.getMessage(), e);
@@ -68,15 +73,11 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
         return false;
     }
 
-    private static void createTable(Statement statement, String tableName, JsonNode fieldsNode) throws Exception {
+    private static void createTable(Statement statement, String tableName, Map<String, String> columns) throws Exception {
         StringBuilder createTableQuery = new StringBuilder("CREATE TABLE IF NOT EXISTS ").append(tableName).append(" (");
 
-        Iterator<Map.Entry<String, JsonNode>> fields = fieldsNode.fields();
-        while (fields.hasNext()) {
-            Map.Entry<String, JsonNode> field = fields.next();
-            String columnName = field.getKey();
-
-            createTableQuery.append(columnName).append(" ").append(COLUMN_TYPE).append(", ");
+        for (Map.Entry<String, String> entry : columns.entrySet()) {
+            createTableQuery.append(entry.getKey()).append(" ").append(entry.getValue()).append(", ");
         }
 
         createTableQuery.append("_timestamp DateTime DEFAULT now()) ENGINE = MergeTree() ORDER BY _timestamp");
@@ -86,71 +87,135 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
         System.out.println("table created: " + tableName);
     }
 
-    private static void addMissingColumns(Statement statement, String tableName, JsonNode fieldsNode) throws Exception {
-        boolean newColumnsAdded = false;
-        String query = "DESCRIBE TABLE " + tableName;
-        ResultSet resultSet = statement.executeQuery(query);
+    private static Map<String, String> extractColumns(JsonNode node) {
+        Map<String, String> columns = new HashMap<>();
+        extractColumnsRecursive("", node, columns);
 
-        Set<String> existingColumns = new HashSet<>();
-        while (resultSet.next()) {
-            String column = resultSet.getString(1);
-            System.out.println("column: " + column);
-            existingColumns.add(column);
-        }
+        return columns;
+    }
 
-        Iterator<Map.Entry<String, JsonNode>> fields = fieldsNode.fields();
-        while (fields.hasNext()) {
-            Map.Entry<String, JsonNode> field = fields.next();
-            String columnName = field.getKey();
+    private static void extractColumnsRecursive(String prefix, JsonNode node, Map<String, String> columns) {
+        if (node.isObject()) {
+            Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> field = fields.next();
+                String key = field.getKey();
+                JsonNode valueNode = field.getValue();
 
-            if (!existingColumns.contains(columnName)) {
-                String alterTableQuery = "ALTER TABLE " + tableName + " ADD COLUMN " + columnName + " " + COLUMN_TYPE;
-                statement.execute(alterTableQuery);
-                System.out.println("added column: " + columnName);
+                String fullKey = prefix.isEmpty() ? key : prefix + "__" + key;
 
-                newColumnsAdded = true;
+                String type = valueNode.path("type").asText();
+
+                if ("object".equals(type)) {
+                    JsonNode fieldsNode = valueNode.path("fields");
+                    if (fieldsNode != null && fieldsNode.isObject()) {
+                        extractColumnsRecursive(fullKey, fieldsNode, columns);
+                    }
+                } else {
+                    columns.put(fullKey, COLUMN_TYPE);
+                }
             }
-        }
-
-        if (newColumnsAdded) {
-            String dropMVQuery = "DROP VIEW IF EXISTS " + tableName + "_kafka_mv";
-            statement.execute(dropMVQuery);
-            System.out.println("mv dropped: " + tableName + "_kafka_mv");
-
-            String dropKafkaTableQuery = "DROP TABLE IF EXISTS " + tableName + "_kafka";
-            statement.execute(dropKafkaTableQuery);
-            System.out.println("kfk table dropped: " + tableName + "_kafka");
-
-            createKafkaConsumer(statement, tableName, fieldsNode);
         }
     }
 
-    private static void createKafkaConsumer(Statement statement, String tableName, JsonNode fieldsNode) throws Exception {
-        StringBuilder createKafkaTableQuery = new StringBuilder("CREATE TABLE IF NOT EXISTS ").append(tableName).append("_kafka (");
+    private static Map<String, String> addMissingColumns(Statement statement, String tableName, Map<String, String> columns) throws Exception {
+        Set<String> existingColumns = getExistingColumns(statement, tableName);
 
-        Iterator<Map.Entry<String, JsonNode>> fields = fieldsNode.fields();
-        while (fields.hasNext()) {
-            Map.Entry<String, JsonNode> field = fields.next();
-            String columnName = field.getKey();
-
-            createKafkaTableQuery.append(columnName).append(" ").append(COLUMN_TYPE).append(", ");
+        Map<String, String> newColumns = new HashMap<>();
+        for (Map.Entry<String, String> entry : columns.entrySet()) {
+            if (!existingColumns.contains(entry.getKey())) {
+                newColumns.put(entry.getKey(), entry.getValue());
+            }
         }
 
-        createKafkaTableQuery.append(") ENGINE = Kafka() ")
-                .append("SETTINGS kafka_broker_list = '192.168.56.101:9092', ")
+        if (!newColumns.isEmpty()) {
+            for (Map.Entry<String, String> entry : newColumns.entrySet()) {
+                String alterTableQuery = "ALTER TABLE " + tableName + " ADD COLUMN " + entry.getKey() + " " + entry.getValue();
+                statement.execute(alterTableQuery);
+                System.out.println("Added column: " + entry.getKey());
+            }
+        }
+
+        return newColumns;
+    }
+
+    private static Set<String> getExistingColumns(Statement statement, String tableName) throws SQLException {
+        String query = "DESCRIBE TABLE " + tableName;
+        Set<String> columns = new HashSet<>();
+
+        try (ResultSet resultSet = statement.executeQuery(query)) {
+            while (resultSet.next()) {
+                String column = resultSet.getString(1);
+                columns.add(column);
+            }
+        }
+
+        return columns;
+    }
+
+    private static void updateMaterializedView(Statement statement, String tableName, Map<String, String> columns, Map<String, String> newColumns) throws Exception {
+        if (!newColumns.isEmpty()) {
+            String mvName = tableName + "_mv";
+            String dropMVQuery = "DROP VIEW IF EXISTS " + mvName;
+            statement.execute(dropMVQuery);
+            System.out.println("Materialized view dropped: " + mvName);
+            createMaterializedView(statement, tableName, columns);
+        }
+    }
+
+    private static void createKafkaTable(Statement statement, String tableName) throws Exception {
+        String kafkaTableName = tableName + "_kafka";
+
+        StringBuilder createKafkaTableQuery = new StringBuilder("CREATE TABLE IF NOT EXISTS ").append(kafkaTableName)
+                .append(" (payload Nullable(String)) ")
+                .append("ENGINE = Kafka() ")
+                .append("SETTINGS kafka_broker_list = '192.168.1.17:9092', ")
                 .append("kafka_topic_list = '").append(tableName).append("_topic', ")
                 .append("kafka_group_name = '").append(tableName).append("_group', ")
-                .append("kafka_format = 'JSONEachRow', kafka_num_consumers = 1");
+                .append("kafka_format = 'JSONAsString', kafka_num_consumers = 1");
 
         System.out.println("createKafkaTableQuery: " + createKafkaTableQuery);
         statement.execute(createKafkaTableQuery.toString());
-        System.out.println("kfk table created: " + tableName + "_kafka");
+        System.out.println("kfk table created: " + kafkaTableName);
+    }
 
-        String createMaterializedViewQuery = "CREATE MATERIALIZED VIEW IF NOT EXISTS " + tableName + "_kafka_mv "
-                + "TO " + tableName + " AS "
-                + "SELECT * FROM " + tableName + "_kafka";
+    private static void createMaterializedView(Statement statement, String tableName, Map<String, String> columns) throws SQLException {
+        String kafkaTableName = tableName + "_kafka";
+        String mvName = tableName + "_mv";
+        StringBuilder selectQuery = new StringBuilder("SELECT ");
 
-        statement.execute(createMaterializedViewQuery);
-        System.out.println("mv created: " + tableName + "_kafka_mv");
+        int i = 0;
+        for (Map.Entry<String, String> entry : columns.entrySet()) {
+            if (i++ > 0) selectQuery.append(", ");
+            selectQuery.append(generateJsonExtractExpression(entry.getKey()));
+        }
+        System.out.println("selectQuery: " + selectQuery);
+
+        String createMVQuery = "CREATE MATERIALIZED VIEW IF NOT EXISTS " + mvName +
+                " TO " + tableName +
+                " AS " + selectQuery +
+                " FROM " + kafkaTableName;
+
+        System.out.println("Create Materialized View query: " + createMVQuery);
+        statement.execute(createMVQuery);
+        System.out.println("Materialized view created: " + mvName);
+    }
+
+    private static String generateJsonExtractExpression(String fullKey) {
+        String[] parts = fullKey.split("__");
+
+        if (fullKey.contains("__")) {
+            StringBuilder expression = new StringBuilder("JSONExtractRaw(payload, '").append(parts[0]).append("')");
+
+            for (int i = 1; i < parts.length - 1; i++) {
+                expression = new StringBuilder("JSONExtractRaw(").append(expression).append(", '").append(parts[i]).append("')");
+            }
+
+            expression = new StringBuilder("JSONExtract(").append(expression).append(", '").append(parts[parts.length - 1])
+                    .append("', 'Nullable(String)') AS ").append(fullKey);
+            return expression.toString();
+        } else {
+            return "JSONExtract(payload, '" + fullKey + "', 'Nullable(String)') AS " + fullKey;
+        }
     }
 }

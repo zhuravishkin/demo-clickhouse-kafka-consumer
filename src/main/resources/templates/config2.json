@@ -11,6 +11,12 @@
       "name": "imei"
     }
   },
+  "imsi": {
+    "type": "long",
+    "source": {
+      "name": "imei"
+    }
+  },
   "context": {
     "type": "object",
     "fields": {

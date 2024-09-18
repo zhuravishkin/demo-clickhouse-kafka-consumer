@@ -1,0 +1,14 @@
+{
+  "msisdn": {
+    "type": "string",
+    "source": {
+      "name": "phone_number"
+    }
+  },
+  "imei": {
+    "type": "string",
+    "source": {
+      "name": "imei"
+    }
+  }
+}
