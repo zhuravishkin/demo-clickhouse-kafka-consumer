@@ -21,6 +21,7 @@ import java.util.*;
 public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
     private static final String CLICKHOUSE_URL = "jdbc:clickhouse://192.168.1.17:18123/zhuravishkin";
     private static final String COLUMN_TYPE = "Nullable(String)";
+    private static final String CLUSTER_NAME = "zhuravishkin_cluster";
 
     public static void main(String[] args) {
         SpringApplication.run(ClickhouseKafkaConsumerApplication.class, args);
@@ -55,6 +56,7 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
                     createKafkaTable(stmt, tableName);
                     createMaterializedView(stmt, tableName, columns);
                     createErrorMaterializedView(stmt, tableName);
+                    createDistributedTable(stmt, "zhuravishkin", tableName);
                 } else {
                     Map<String, String> newColumns = addMissingColumns(stmt, tableName, columns);
                     updateMaterializedView(stmt, tableName, columns, newColumns);
@@ -76,14 +78,16 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
     }
 
     private static void createTable(Statement statement, String tableName, Map<String, String> columns) throws Exception {
-        StringBuilder createTableQuery = new StringBuilder("CREATE TABLE IF NOT EXISTS ").append(tableName).append(" (");
+        StringBuilder createTableQuery = new StringBuilder("CREATE TABLE IF NOT EXISTS ").append(tableName).append(" ON CLUSTER ").append(CLUSTER_NAME).append(" (");
 
         for (Map.Entry<String, String> entry : columns.entrySet()) {
             createTableQuery.append(entry.getKey()).append(" ").append(entry.getValue()).append(", ");
         }
 
-        createTableQuery.append("_timestamp DateTime DEFAULT now()) ENGINE = MergeTree() ORDER BY _timestamp ");
-        createTableQuery.append("TTL _timestamp + INTERVAL 3 DAY");
+        createTableQuery.append("_timestamp DateTime DEFAULT now()) ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/")
+                .append(tableName)
+                .append("', '{replica}') ORDER BY _timestamp ")
+                .append("TTL _timestamp + INTERVAL 3 DAY");
         System.out.println(createTableQuery);
 
         statement.execute(createTableQuery.toString());
@@ -92,14 +96,41 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
 
     private static void createErrorTable(Statement statement, String tableName) throws SQLException {
         String errorTableName = tableName + "_errors";
-        String createErrorTableQuery = "CREATE TABLE IF NOT EXISTS " + errorTableName + " (" +
-                "payload String, " +
-                "error_message String, " +
-                "_timestamp DateTime DEFAULT now()" +
-                ") ENGINE = MergeTree() ORDER BY _timestamp TTL _timestamp + INTERVAL 3 DAY";
 
-        statement.execute(createErrorTableQuery);
+        StringBuilder createErrorTableQuery = new StringBuilder("CREATE TABLE IF NOT EXISTS ").append(errorTableName)
+                .append(" ON CLUSTER ").append(CLUSTER_NAME)
+                .append(" (payload String, ")
+                .append("error_message String, ")
+                .append("_timestamp DateTime DEFAULT now()")
+                .append(") ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/").append(errorTableName)
+                .append("', '{replica}') ")
+                .append("ORDER BY _timestamp TTL _timestamp + INTERVAL 3 DAY");
+
+        statement.execute(createErrorTableQuery.toString());
         System.out.println("error table created: " + errorTableName);
+    }
+
+    private static void createDistributedTable(Statement statement, String databaseName, String tableName) throws SQLException {
+        String distributedTableName = tableName + "_all";
+        String localTableName = tableName;
+
+        String fullDistributedTableName = databaseName + "." + distributedTableName;
+        String fullLocalTableName = databaseName + "." + localTableName;
+
+        String dropDistributedTableQuery = "DROP TABLE IF EXISTS " + fullDistributedTableName + " ON CLUSTER " + CLUSTER_NAME;
+        statement.execute(dropDistributedTableQuery);
+        System.out.println("Distributed table dropped: " + distributedTableName);
+
+        StringBuilder createDistributedTableQuery = new StringBuilder("CREATE TABLE ").append(fullDistributedTableName)
+                .append(" ON CLUSTER ").append(CLUSTER_NAME)
+                .append(" AS ").append(fullLocalTableName)
+                .append(" ENGINE = Distributed(").append(CLUSTER_NAME).append(", ")
+                .append(databaseName).append(", ")
+                .append(localTableName).append(", rand());");
+
+        System.out.println("Create Distributed Table query: " + createDistributedTableQuery);
+        statement.execute(createDistributedTableQuery.toString());
+        System.out.println("Distributed table created: " + distributedTableName);
     }
 
     private static Map<String, String> extractColumns(JsonNode node) {
@@ -134,6 +165,8 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
     }
 
     private static Map<String, String> addMissingColumns(Statement statement, String tableName, Map<String, String> columns) throws Exception {
+        String distributedTableName = tableName + "_all";
+
         Set<String> existingColumns = getExistingColumns(statement, tableName);
 
         Map<String, String> newColumns = new HashMap<>();
@@ -145,8 +178,10 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
 
         if (!newColumns.isEmpty()) {
             for (Map.Entry<String, String> entry : newColumns.entrySet()) {
-                String alterTableQuery = "ALTER TABLE " + tableName + " ADD COLUMN " + entry.getKey() + " " + entry.getValue();
+                String alterTableQuery = "ALTER TABLE " + tableName + " ON CLUSTER " + CLUSTER_NAME + " ADD COLUMN " + entry.getKey() + " " + entry.getValue();
                 statement.execute(alterTableQuery);
+                String alterDistributedTableQuery = "ALTER TABLE " + distributedTableName + " ON CLUSTER " + CLUSTER_NAME + " ADD COLUMN " + entry.getKey() + " " + entry.getValue();
+                statement.execute(alterDistributedTableQuery);
                 System.out.println("Added column: " + entry.getKey());
             }
         }
@@ -168,31 +203,33 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
         return columns;
     }
 
-    private static void updateMaterializedView(Statement statement, String tableName, Map<String, String> columns, Map<String, String> newColumns) throws Exception {
-        if (!newColumns.isEmpty()) {
-            String mvName = tableName + "_mv";
-            String dropMVQuery = "DROP VIEW IF EXISTS " + mvName;
-            statement.execute(dropMVQuery);
-            System.out.println("Materialized view dropped: " + mvName);
-            createMaterializedView(statement, tableName, columns);
-        }
-    }
-
     private static void createKafkaTable(Statement statement, String tableName) throws Exception {
         String kafkaTableName = tableName + "_kafka";
 
         StringBuilder createKafkaTableQuery = new StringBuilder("CREATE TABLE IF NOT EXISTS ").append(kafkaTableName)
+                .append(" ON CLUSTER ").append(CLUSTER_NAME)
                 .append(" (payload Nullable(String)) ")
                 .append("ENGINE = Kafka() ")
                 .append("SETTINGS kafka_broker_list = '192.168.1.17:9092', ")
                 .append("kafka_topic_list = '").append(tableName).append("_topic', ")
                 .append("kafka_group_name = '").append(tableName).append("_group', ")
+                .append("kafka_client_id = '").append(tableName).append("_client', ")
                 .append("kafka_format = 'JSONAsString', kafka_num_consumers = 1, ")
                 .append("kafka_handle_error_mode = 'stream'");
 
         System.out.println("createKafkaTableQuery: " + createKafkaTableQuery);
         statement.execute(createKafkaTableQuery.toString());
         System.out.println("kfk table created: " + kafkaTableName);
+    }
+
+    private static void updateMaterializedView(Statement statement, String tableName, Map<String, String> columns, Map<String, String> newColumns) throws Exception {
+        if (!newColumns.isEmpty()) {
+            String mvName = tableName + "_mv";
+            String dropMVQuery = "DROP VIEW IF EXISTS " + mvName + " ON CLUSTER " + CLUSTER_NAME;
+            statement.execute(dropMVQuery);
+            System.out.println("Materialized view dropped: " + mvName);
+            createMaterializedView(statement, tableName, columns);
+        }
     }
 
     private static void createMaterializedView(Statement statement, String tableName, Map<String, String> columns) throws SQLException {
@@ -207,14 +244,15 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
         }
         System.out.println("selectQuery: " + selectQuery);
 
-        String createMVQuery = "CREATE MATERIALIZED VIEW IF NOT EXISTS " + mvName +
-                " TO " + tableName +
-                " AS " + selectQuery +
-                " FROM " + kafkaTableName +
-                " WHERE _error = ''";
+        StringBuilder createMVQuery = new StringBuilder("CREATE MATERIALIZED VIEW IF NOT EXISTS ").append(mvName)
+                .append(" ON CLUSTER ").append(CLUSTER_NAME)
+                .append(" TO ").append(tableName)
+                .append(" AS ").append(selectQuery)
+                .append(" FROM ").append(kafkaTableName)
+                .append(" WHERE _error = ''");
 
         System.out.println("Create Materialized View query: " + createMVQuery);
-        statement.execute(createMVQuery);
+        statement.execute(createMVQuery.toString());
         System.out.println("Materialized view created: " + mvName);
     }
 
@@ -223,16 +261,17 @@ public class ClickhouseKafkaConsumerApplication implements CommandLineRunner {
         String errorMVName = tableName + "_errors_mv";
         String errorTableName = tableName + "_errors";
 
-        String createErrorMVQuery = "CREATE MATERIALIZED VIEW IF NOT EXISTS " + errorMVName +
-                " TO " + errorTableName +
-                " AS SELECT " +
-                "_raw_message AS payload, " +
-                "_error AS error_message" +
-                " FROM " + kafkaTableName +
-                " WHERE _error != ''";
+        StringBuilder createErrorMVQuery = new StringBuilder("CREATE MATERIALIZED VIEW IF NOT EXISTS ").append(errorMVName)
+                .append(" ON CLUSTER ").append(CLUSTER_NAME)
+                .append(" TO ").append(errorTableName)
+                .append(" AS SELECT ")
+                .append(" _raw_message AS payload,")
+                .append(" _error AS error_message")
+                .append(" FROM ").append(kafkaTableName)
+                .append(" WHERE _error != ''");
 
         System.out.println("Create Error Materialized View query: " + createErrorMVQuery);
-        statement.execute(createErrorMVQuery);
+        statement.execute(createErrorMVQuery.toString());
         System.out.println("Error Materialized view created: " + errorMVName);
     }
 
